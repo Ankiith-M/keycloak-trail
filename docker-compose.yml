@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  users:
+    build: ./users
+    env_file: ./users/.env
+    network_mode: "host"
+    # optional healthcheck (needs a public ping); skip for now
+
+  orders:
+    build: ./orders
+    env_file: ./orders/.env
+    network_mode: "host"
+
+  payments:
+    build: ./payments
+    env_file: ./payments/.env
+    network_mode: "host"

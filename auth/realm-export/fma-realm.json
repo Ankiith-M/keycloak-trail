@@ -1,0 +1,10 @@
+{
+  "realm": "FMA",
+  "enabled": true,
+  "roles": {
+    "realm": [
+      { "name": "ADMIN" },
+      { "name": "CUSTOMER" }
+    ]
+  }
+}

@@ -1,0 +1,644 @@
+# # Terraform FMA — ECS Keycloak + App Runner + RDS (baseline)
+
+# This single-file baseline stands up:
+# - RDS Postgres (single-AZ dev default)
+# - Secrets Manager secrets (`rds/keycloak`, `keycloak/admin`, `rds/app`)
+# - Keycloak on ECS (Fargate) behind an Internet ALB with HTTPS
+# - Three App Runner services (users, orders, payments) with VPC egress to RDS
+
+# > ⚠️ Replace all `REPLACE_ME_*` placeholders, review defaults, and split into modules for production.
+
+# ---
+
+# ## main.tf
+
+# ```hcl
+# terraform {
+#   required_version = ">= 1.6"
+#   required_providers {
+#     aws = {
+#       source  = "hashicorp/aws"
+#       version = ">= 5.30"
+#     }
+#   }
+# }
+
+# provider "aws" {
+#   region = var.aws_region
+# }
+
+# data "aws_caller_identity" "current" {}
+
+# data "aws_region" "current" {}
+
+# ########################
+# # INPUTS (via variables)
+# ########################
+# # VPC + subnets exist already — pass IDs in.
+
+# ########################
+# # RDS (dev defaults)
+# ########################
+# resource "aws_db_subnet_group" "this" {
+#   name       = "fma-rds-subnets"
+#   subnet_ids = var.private_subnet_ids
+# }
+
+# resource "aws_security_group" "rds" {
+#   name        = "fma-rds-sg"
+#   description = "Allow Postgres from ECS tasks and App Runner VPC connector"
+#   vpc_id      = var.vpc_id
+
+#   ingress {
+#     description      = "Postgres from ECS tasks"
+#     from_port        = 5432
+#     to_port          = 5432
+#     protocol         = "tcp"
+#     security_groups  = [aws_security_group.ecs_tasks.id]
+#   }
+
+#   ingress {
+#     description      = "Postgres from App Runner connector"
+#     from_port        = 5432
+#     to_port          = 5432
+#     protocol         = "tcp"
+#     security_groups  = [aws_security_group.apprunner_connector.id]
+#   }
+
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+# resource "aws_db_instance" "this" {
+#   identifier              = "fma-postgres"
+#   engine                  = "postgres"
+#   engine_version          = "16"
+#   instance_class          = var.rds_instance_class
+#   allocated_storage       = 20
+#   db_subnet_group_name    = aws_db_subnet_group.this.name
+#   vpc_security_group_ids  = [aws_security_group.rds.id]
+#   username                = var.rds_master_username
+#   password                = var.rds_master_password
+#   skip_final_snapshot     = true
+#   publicly_accessible     = false
+#   multi_az                = false
+# }
+
+# ########################
+# # Secrets Manager
+# ########################
+# resource "aws_secretsmanager_secret" "rds_keycloak" {
+#   name        = "rds/keycloak"
+#   description = "Password for kc_user"
+# }
+# resource "aws_secretsmanager_secret_version" "rds_keycloak_v" {
+#   secret_id     = aws_secretsmanager_secret.rds_keycloak.id
+#   secret_string = var.kc_user_password
+# }
+
+# resource "aws_secretsmanager_secret" "rds_app" {
+#   name        = "rds/app"
+#   description = "Password for fma_user"
+# }
+# resource "aws_secretsmanager_secret_version" "rds_app_v" {
+#   secret_id     = aws_secretsmanager_secret.rds_app.id
+#   secret_string = var.fma_user_password
+# }
+
+# resource "aws_secretsmanager_secret" "keycloak_admin" {
+#   name        = "keycloak/admin"
+#   description = "Keycloak admin (master realm) password"
+# }
+# resource "aws_secretsmanager_secret_version" "keycloak_admin_v" {
+#   secret_id     = aws_secretsmanager_secret.keycloak_admin.id
+#   secret_string = var.keycloak_admin_password
+# }
+
+# ########################
+# # Security groups for ECS/ALB/App Runner
+# ########################
+# resource "aws_security_group" "alb" {
+#   name   = "fma-keycloak-alb-sg"
+#   vpc_id = var.vpc_id
+#   ingress {
+#     description = "HTTP"
+#     from_port   = 80
+#     to_port     = 80
+#     protocol    = "tcp"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+#   ingress {
+#     description = "HTTPS"
+#     from_port   = 443
+#     to_port     = 443
+#     protocol    = "tcp"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+# resource "aws_security_group" "ecs_tasks" {
+#   name   = "fma-ecs-tasks-sg"
+#   vpc_id = var.vpc_id
+#   ingress {
+#     description     = "From ALB to Keycloak"
+#     from_port       = 8080
+#     to_port         = 8080
+#     protocol        = "tcp"
+#     security_groups = [aws_security_group.alb.id]
+#   }
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+# resource "aws_security_group" "apprunner_connector" {
+#   name   = "fma-apprunner-vpc-connector-sg"
+#   vpc_id = var.vpc_id
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+# ########################
+# # Keycloak on ECS Fargate + ALB
+# ########################
+# resource "aws_ecs_cluster" "keycloak" {
+#   name = "fma-keycloak"
+# }
+
+# resource "aws_iam_role" "ecs_task_exec" {
+#   name = "fma-ecs-task-exec-role"
+#   assume_role_policy = jsonencode({
+#     Version = "2012-10-17"
+#     Statement = [{
+#       Effect = "Allow",
+#       Principal = { Service = "ecs-tasks.amazonaws.com" },
+#       Action   = "sts:AssumeRole"
+#     }]
+#   })
+# }
+
+# resource "aws_iam_role_policy_attachment" "ecs_task_exec" {
+#   role       = aws_iam_role.ecs_task_exec.name
+#   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+# }
+
+# resource "aws_iam_role_policy" "ecs_task_exec_secrets" {
+#   name = "fma-ecs-task-exec-secrets"
+#   role = aws_iam_role.ecs_task_exec.id
+#   policy = jsonencode({
+#     Version = "2012-10-17",
+#     Statement = [{
+#       Effect   = "Allow",
+#       Action   = ["secretsmanager:GetSecretValue"],
+#       Resource = [
+#         aws_secretsmanager_secret.rds_keycloak.arn,
+#         aws_secretsmanager_secret.keycloak_admin.arn
+#       ]
+#     }]
+#   })
+# }
+
+# # Task Role (app permissions if needed later)
+# resource "aws_iam_role" "ecs_task" {
+#   name = "fma-ecs-task-role"
+#   assume_role_policy = jsonencode({
+#     Version = "2012-10-17"
+#     Statement = [{
+#       Effect = "Allow",
+#       Principal = { Service = "ecs-tasks.amazonaws.com" },
+#       Action   = "sts:AssumeRole"
+#     }]
+#   })
+# }
+
+# # ALB
+# resource "aws_lb" "keycloak" {
+#   name               = "fma-keycloak-alb"
+#   load_balancer_type = "application"
+#   subnets            = var.public_subnet_ids
+#   security_groups    = [aws_security_group.alb.id]
+# }
+
+# resource "aws_lb_target_group" "keycloak" {
+#   name        = "fma-keycloak-tg"
+#   port        = 8080
+#   protocol    = "HTTP"
+#   vpc_id      = var.vpc_id
+#   target_type = "ip" # Fargate
+
+#   health_check {
+#     path                = "/realms/master"
+#     matcher             = "200-399"
+#     interval            = 30
+#     timeout             = 5
+#     healthy_threshold   = 2
+#     unhealthy_threshold = 3
+#   }
+# }
+
+# resource "aws_lb_listener" "http" {
+#   load_balancer_arn = aws_lb.keycloak.arn
+#   port              = 80
+#   protocol          = "HTTP"
+
+#   default_action {
+#     type = "redirect"
+#     redirect {
+#       port        = "443"
+#       protocol    = "HTTPS"
+#       status_code = "HTTP_301"
+#     }
+#   }
+# }
+
+# resource "aws_lb_listener" "https" {
+#   load_balancer_arn = aws_lb.keycloak.arn
+#   port              = 443
+#   protocol          = "HTTPS"
+#   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+#   certificate_arn   = var.acm_certificate_arn
+
+#   default_action {
+#     type             = "forward"
+#     target_group_arn = aws_lb_target_group.keycloak.arn
+#   }
+# }
+
+# # ECS task definition for Keycloak
+# locals {
+#   kc_db_url = "jdbc:postgresql://${aws_db_instance.this.address}:5432/keycloak"
+# }
+
+# resource "aws_ecs_task_definition" "keycloak" {
+#   family                   = "fma-keycloak"
+#   network_mode             = "awsvpc"
+#   requires_compatibilities = ["FARGATE"]
+#   cpu                      = 512
+#   memory                   = 1024
+#   execution_role_arn       = aws_iam_role.ecs_task_exec.arn
+#   task_role_arn            = aws_iam_role.ecs_task.arn
+
+#   container_definitions = jsonencode([
+#     {
+#       name      = "keycloak"
+#       image     = var.ecr_image_keycloak # e.g. <acct>.dkr.ecr.<region>.amazonaws.com/keycloak:24.0.5
+#       essential = true
+#       portMappings = [{ containerPort = 8080, hostPort = 8080, protocol = "tcp" }]
+#       environment = [
+#         { name = "KC_PROXY",       value = "edge" },
+#         { name = "KC_DB",          value = "postgres" },
+#         { name = "KC_DB_URL",      value = local.kc_db_url },
+#         { name = "KC_DB_USERNAME", value = "kc_user" },
+#         { name = "KC_HOSTNAME",    value = var.keycloak_hostname },
+#         { name = "KC_HEALTH_ENABLED", value = "true" }
+#       ]
+#       secrets = [
+#         { name = "KC_DB_PASSWORD",       valueFrom = aws_secretsmanager_secret.rds_keycloak.arn },
+#         { name = "KEYCLOAK_ADMIN_PASSWORD", valueFrom = aws_secretsmanager_secret.keycloak_admin.arn }
+#       ]
+#       # Keycloak 24+ uses KEYCLOAK_ADMIN as env (not secret) — provide via TF var
+#       # If you prefer secret, set via secrets[] too and unset here.
+#       # Keeping admin user in env is acceptable for dev only.
+#       environmentFiles = []
+#       environment += [{ name = "KEYCLOAK_ADMIN", value = var.keycloak_admin_username }]
+#       healthCheck = {
+#         command     = ["CMD-SHELL", "curl -fsS http://localhost:8080/realms/master > /dev/null || exit 1"]
+#         interval    = 30
+#         timeout     = 5
+#         retries     = 3
+#         startPeriod = 30
+#       }
+#       logConfiguration = {
+#         logDriver = "awslogs"
+#         options = {
+#           awslogs-group         = "/ecs/fma-keycloak"
+#           awslogs-region        = data.aws_region.current.name
+#           awslogs-stream-prefix = "ecs"
+#         }
+#       }
+#     }
+#   ])
+# }
+
+# resource "aws_cloudwatch_log_group" "kc" {
+#   name              = "/ecs/fma-keycloak"
+#   retention_in_days = 14
+# }
+
+# resource "aws_ecs_service" "keycloak" {
+#   name                               = "fma-keycloak"
+#   cluster                            = aws_ecs_cluster.keycloak.id
+#   task_definition                    = aws_ecs_task_definition.keycloak.arn
+#   desired_count                      = var.keycloak_desired_count
+#   launch_type                        = "FARGATE"
+#   enable_execute_command             = true
+#   deployment_minimum_healthy_percent = 50
+#   deployment_maximum_percent         = 200
+
+#   network_configuration {
+#     subnets         = var.private_subnet_ids
+#     security_groups = [aws_security_group.ecs_tasks.id]
+#     assign_public_ip = false
+#   }
+
+#   load_balancer {
+#     target_group_arn = aws_lb_target_group.keycloak.arn
+#     container_name   = "keycloak"
+#     container_port   = 8080
+#   }
+
+#   depends_on = [aws_lb_listener.https]
+# }
+
+# ########################
+# # App Runner (users/orders/payments)
+# ########################
+# # Use the community module to simplify secrets & VPC connector management.
+# module "app_runner_shared" {
+#   source = "terraform-aws-modules/app-runner/aws"
+
+#   create_service = false
+
+#   auto_scaling_configurations = {
+#     default = {
+#       name            = "fma-default"
+#       max_concurrency = 100
+#       max_size        = 5
+#       min_size        = 1
+#     }
+#   }
+# }
+
+# # App Runner VPC connector to reach RDS in private subnets
+# module "apprunner_users" {
+#   source = "terraform-aws-modules/app-runner/aws"
+
+#   service_name = "fma-users"
+#   auto_scaling_configuration_arn = module.app_runner_shared.auto_scaling_configurations["default"].arn
+
+#   # Allow instance role to read DB secret
+#   instance_policy_statements = {
+#     Secrets = {
+#       actions   = ["secretsmanager:GetSecretValue"]
+#       resources = [aws_secretsmanager_secret.rds_app.arn]
+#     }
+#   }
+
+#   source_configuration = {
+#     auto_deployments_enabled = true
+#     image_repository = {
+#       image_identifier      = var.ecr_image_users
+#       image_repository_type = "ECR"
+#       image_configuration   = {
+#         port = 3001
+#         runtime_environment_variables = {
+#           KEYCLOAK_ISSUER    = "https://${var.keycloak_hostname}/realms/FMA"
+#           KEYCLOAK_AUDIENCE  = "users-svc"
+#           DB_HOST            = aws_db_instance.this.address
+#           DB_PORT            = "5432"
+#           DB_NAME            = "fma"
+#           DB_USER            = "fma_user"
+#           DB_SCHEMA          = "users"
+#         }
+#         runtime_environment_secrets = {
+#           DB_PASS = aws_secretsmanager_secret.rds_app.arn
+#         }
+#       }
+#     }
+#   }
+
+#   create_vpc_connector          = true
+#   vpc_connector_subnets         = var.private_subnet_ids
+#   vpc_connector_security_groups = [aws_security_group.apprunner_connector.id]
+#   network_configuration = {
+#     egress_configuration = { egress_type = "VPC" }
+#     ingress_configuration = { is_publicly_accessible = true }
+#   }
+
+#   health_check_configuration = { path = "/" }
+# }
+
+# module "apprunner_orders" {
+#   source = "terraform-aws-modules/app-runner/aws"
+
+#   service_name = "fma-orders"
+#   auto_scaling_configuration_arn = module.app_runner_shared.auto_scaling_configurations["default"].arn
+
+#   instance_policy_statements = {
+#     Secrets = {
+#       actions   = ["secretsmanager:GetSecretValue"]
+#       resources = [aws_secretsmanager_secret.rds_app.arn]
+#     }
+#   }
+
+#   source_configuration = {
+#     auto_deployments_enabled = true
+#     image_repository = {
+#       image_identifier      = var.ecr_image_orders
+#       image_repository_type = "ECR"
+#       image_configuration   = {
+#         port = 3002
+#         runtime_environment_variables = {
+#           KEYCLOAK_ISSUER    = "https://${var.keycloak_hostname}/realms/FMA"
+#           KEYCLOAK_AUDIENCE  = "orders-svc"
+#           DB_HOST            = aws_db_instance.this.address
+#           DB_PORT            = "5432"
+#           DB_NAME            = "fma"
+#           DB_USER            = "fma_user"
+#           DB_SCHEMA          = "orders"
+#           ALLOWED_SERVICE_AZP = "payments-svc"
+#         }
+#         runtime_environment_secrets = {
+#           DB_PASS = aws_secretsmanager_secret.rds_app.arn
+#         }
+#       }
+#     }
+#   }
+
+#   create_vpc_connector          = true
+#   vpc_connector_subnets         = var.private_subnet_ids
+#   vpc_connector_security_groups = [aws_security_group.apprunner_connector.id]
+#   network_configuration = {
+#     egress_configuration = { egress_type = "VPC" }
+#     ingress_configuration = { is_publicly_accessible = true }
+#   }
+
+#   health_check_configuration = { path = "/" }
+# }
+
+# module "apprunner_payments" {
+#   source = "terraform-aws-modules/app-runner/aws"
+
+#   service_name = "fma-payments"
+#   auto_scaling_configuration_arn = module.app_runner_shared.auto_scaling_configurations["default"].arn
+
+#   source_configuration = {
+#     auto_deployments_enabled = true
+#     image_repository = {
+#       image_identifier      = var.ecr_image_payments
+#       image_repository_type = "ECR"
+#       image_configuration   = {
+#         port = 3003
+#         runtime_environment_variables = {
+#           KEYCLOAK_ISSUER     = "https://${var.keycloak_hostname}/realms/FMA"
+#           KEYCLOAK_AUDIENCE   = "payments-svc"
+#           ORDERS_BASE_URL     = module.apprunner_orders.service_url
+#           # payments uses client_credentials against Keycloak; store client secret in KC if applicable
+#         }
+#       }
+#     }
+#   }
+
+#   create_vpc_connector          = true
+#   vpc_connector_subnets         = var.private_subnet_ids
+#   vpc_connector_security_groups = [aws_security_group.apprunner_connector.id]
+#   network_configuration = {
+#     egress_configuration = { egress_type = "VPC" }
+#     ingress_configuration = { is_publicly_accessible = true }
+#   }
+
+#   health_check_configuration = { path = "/" }
+# }
+
+# ########################
+# # Outputs
+# ########################
+# output "keycloak_url" {
+#   value = "https://${var.keycloak_hostname}"
+# }
+
+# output "apprunner_users_url" {
+#   value = module.apprunner_users.service_url
+# }
+
+# output "apprunner_orders_url" {
+#   value = module.apprunner_orders.service_url
+# }
+
+# output "apprunner_payments_url" {
+#   value = module.apprunner_payments.service_url
+# }
+
+# output "rds_endpoint" {
+#   value = aws_db_instance.this.address
+# }
+# ```
+
+# ---
+
+# ## variables.tf
+
+# ```hcl
+# variable "aws_region" { type = string }
+
+# variable "vpc_id" { type = string }
+# variable "public_subnet_ids" { type = list(string) }
+# variable "private_subnet_ids" { type = list(string) }
+
+# variable "acm_certificate_arn" { type = string }
+
+# # ECR images
+# variable "ecr_image_keycloak" { type = string } # <acct>.dkr.ecr.<region>.amazonaws.com/keycloak:24.0.5
+# variable "ecr_image_users"    { type = string }
+# variable "ecr_image_orders"   { type = string }
+# variable "ecr_image_payments" { type = string }
+
+# # RDS master (for initial DB create). For production, rotate and lock down.
+# variable "rds_master_username" { type = string  default = "postgres" }
+# variable "rds_master_password" { type = string  sensitive = true }
+# variable "rds_instance_class"  { type = string  default = "db.t4g.micro" }
+
+# # App DB users (stored into Secrets Manager)
+# variable "kc_user_password"   { type = string  sensitive = true }
+# variable "fma_user_password"  { type = string  sensitive = true }
+
+# # Keycloak admin bootstrap
+# variable "keycloak_admin_username" { type = string  default = "admin" }
+# variable "keycloak_admin_password" { type = string  sensitive = true }
+
+# # Public hostname for Keycloak (behind ALB)
+# variable "keycloak_hostname" { type = string } # e.g. auth.example.com
+
+# variable "keycloak_desired_count" { type = number default = 1 }
+# ```
+
+# ---
+
+# ## README (how to finish setup)
+
+# 1) **Run Terraform** with your VPC + subnets and images filled in.
+# 2) **Create DBs and roles** on the new RDS endpoint (manual or via migration tooling):
+
+# ```sql
+# -- Connect as master to the RDS endpoint
+# CREATE ROLE kc_user LOGIN PASSWORD '<kc_user_password>';  
+# CREATE DATABASE keycloak OWNER kc_user;  
+# \c keycloak  
+# ALTER SCHEMA public OWNER TO kc_user;
+
+# CREATE ROLE fma_user LOGIN PASSWORD '<fma_user_password>';  
+# CREATE DATABASE fma OWNER fma_user;  
+# \c fma  
+# CREATE SCHEMA IF NOT EXISTS users AUTHORIZATION fma_user;  
+# CREATE SCHEMA IF NOT EXISTS orders AUTHORIZATION fma_user;
+# ```
+
+# 3) **Initialize Keycloak** (first boot will use `KEYCLOAK_ADMIN` / `KEYCLOAK_ADMIN_PASSWORD`).
+#    - In the Admin console, create realm `FMA`, roles `ADMIN`, `CUSTOMER`, clients `dev-cli (public)`, `users-svc`, `orders-svc`, `payments-svc` (service account ON).
+#    - Add audience mappers so **end-user** tokens include `aud: users-svc` and **machine** tokens from payments include `aud: orders-svc`.  
+#    - Ensure realm keys (JWKS) are accessible at `https://<keycloak_hostname>/realms/FMA/protocol/openid-connect/certs`.
+
+# 4) **Update services** (already configured above):
+#    - `KEYCLOAK_ISSUER=https://<keycloak_hostname>/realms/FMA`  
+#    - `KEYCLOAK_AUDIENCE` set per service.  
+#    - Orders set `ALLOWED_SERVICE_AZP=payments-svc`.  
+#    - DB envs point to the RDS endpoint; password pulled from Secrets Manager.
+
+# 5) **Smoke tests (cloud)**
+
+# ```bash
+# # Token
+# curl -s -X POST \
+#   -d "client_id=dev-cli" -d "grant_type=password" \
+#   -d "username=alice" -d "password=Alice@123" -d "scope=openid" \
+#   https://${var.keycloak_hostname}/realms/FMA/protocol/openid-connect/token | jq -r .access_token
+
+# # Users
+# curl -s -H "Authorization: Bearer $TOKEN" $(terraform output -raw apprunner_users_url)/users/me | jq
+
+# # Orders
+# curl -s -X POST $(terraform output -raw apprunner_orders_url)/orders \
+#   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+#   -d '{"totalAmount":799.50,"currency":"INR"}' | jq
+# curl -s -H "Authorization: Bearer $TOKEN" $(terraform output -raw apprunner_orders_url)/orders | jq
+
+# # Payments (machine-to-orders)
+# curl -s -X PATCH $(terraform output -raw apprunner_payments_url)/payments/debug/pay/<orderId> | jq
+# ```
+
+# ---
+
+# ## Notes & gotchas
+# - Keycloak **must** run with `KC_PROXY=edge` and a stable `KC_HOSTNAME=https://auth.<your-domain>` behind ALB. See Keycloak docs on hostname & reverse proxy.
+# - ALB health check `path=/realms/master` works once Keycloak is up; first boot may take ~30–60s.
+# - App Runner **VPC egress** is required for RDS; this file creates one connector per service. Consider a **shared** connector in prod.
+# - Grant App Runner **instance role** permission to read Secrets Manager values used as `runtime_environment_secrets`.
+# - Set `assign_public_ip=false` for ECS service (private subnets); ALB lives in public subnets.
+# - For HA, set `keycloak_desired_count=2` and enable ALB target stickiness.
